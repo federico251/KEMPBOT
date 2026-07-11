@@ -64,14 +64,52 @@ def get_sheets_service():
     return build("sheets", "v4", credentials=creds)
 
 def append_row(sheet_name, values):
+    """Inserisce una riga prima della riga TOTALI."""
     service = get_sheets_service()
-    body = {"values": [values]}
-    service.spreadsheets().values().append(
+    
+    # Trova la riga TOTALI
+    result = service.spreadsheets().values().get(
         spreadsheetId=SPREADSHEET_ID,
-        range=f"{sheet_name}!A:Z",
+        range=f"{sheet_name}!A:A"
+    ).execute()
+    rows = result.get("values", [])
+    
+    # Cerca la riga TOTALI o l'ultima riga con dati
+    insert_row = len(rows) + 1  # default: dopo ultima riga
+    for i, row in enumerate(rows):
+        if row and "TOTALI" in str(row[0]).upper():
+            insert_row = i + 1  # riga 1-indexed prima di TOTALI
+            break
+    
+    # Ottieni sheet ID per insertDimension
+    meta = service.spreadsheets().get(spreadsheetId=SPREADSHEET_ID).execute()
+    sheet_id = None
+    for s in meta["sheets"]:
+        if s["properties"]["title"] == sheet_name:
+            sheet_id = s["properties"]["sheetId"]
+            break
+    
+    if sheet_id is None:
+        return
+    
+    # Inserisci riga vuota prima di TOTALI
+    service.spreadsheets().batchUpdate(
+        spreadsheetId=SPREADSHEET_ID,
+        body={"requests": [{"insertDimension": {"range": {
+            "sheetId": sheet_id,
+            "dimension": "ROWS",
+            "startIndex": insert_row - 1,
+            "endIndex": insert_row
+        }, "inheritFromBefore": True}}]}
+    ).execute()
+    
+    # Scrivi i valori nella riga inserita
+    range_str = f"{sheet_name}!A{insert_row}"
+    service.spreadsheets().values().update(
+        spreadsheetId=SPREADSHEET_ID,
+        range=range_str,
         valueInputOption="USER_ENTERED",
-        insertDataOption="INSERT_ROWS",
-        body=body
+        body={"values": [values]}
     ).execute()
 
 def get_sheet_data(sheet_name):
@@ -152,13 +190,27 @@ def chiedi_claude(testo=None, immagine_b64=None, mime_type="image/jpeg"):
     if immagine_b64:
         if mime_type == "application/pdf":
             content = [
-                {"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": immagine_b64}},
-                {"type": "text", "text": testo or "Analizza questa fattura/documento e inseriscila nel foglio contabilità di Kemp Studio."}
+                {
+                    "type": "document",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "application/pdf",
+                        "data": immagine_b64
+                    }
+                },
+                {
+                    "type": "text",
+                    "text": testo or (
+                        "Analizza questa fattura/documento PDF di Kemp Studio SRL. "
+                        "Estrai: fornitore, data, imponibile, IVA, totale, metodo pagamento. "
+                        "Rispondi SOLO con JSON valido nel formato inserisci_uscita o inserisci_entrata."
+                    )
+                }
             ]
         else:
             content = [
                 {"type": "image", "source": {"type": "base64", "media_type": mime_type, "data": immagine_b64}},
-                {"type": "text", "text": testo or "Analizza questo scontrino/fattura e inseriscilo nel foglio contabilità."}
+                {"type": "text", "text": testo or "Analizza questo scontrino/fattura e inseriscilo nel foglio contabilità di Kemp Studio. Rispondi SOLO con JSON."}
             ]
     else:
         content = testo
@@ -172,14 +224,37 @@ def chiedi_claude(testo=None, immagine_b64=None, mime_type="image/jpeg"):
         },
         json={
             "model": "claude-sonnet-4-6",
-            "max_tokens": 600,
+            "max_tokens": 800,
             "system": system,
             "messages": [{"role": "user", "content": content}]
         }
     )
-    raw = resp.json()["content"][0]["text"].strip()
+    resp_json = resp.json()
+    
+    # Gestisci errori API
+    if "error" in resp_json:
+        return {"azione": "chiedi", "testo": f"Errore API: {resp_json['error'].get('message', 'sconosciuto')}"}
+    
+    if not resp_json.get("content"):
+        return {"azione": "chiedi", "testo": "Non ho ricevuto risposta. Riprova o scrivi i dati a mano."}
+    
+    raw = resp_json["content"][0]["text"].strip()
     raw = raw.replace("```json", "").replace("```", "").strip()
-    return json.loads(raw)
+    
+    # Se non inizia con { prova a trovare il JSON nel testo
+    if not raw.startswith("{"):
+        import re
+        match = re.search(r'\{.*\}', raw, re.DOTALL)
+        if match:
+            raw = match.group(0)
+        else:
+            # Claude ha risposto in testo libero — chiedilo come domanda
+            return {"azione": "chiedi", "testo": raw[:500]}
+    
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        return {"azione": "chiedi", "testo": "Non sono riuscito ad analizzare il documento. Puoi scrivere i dati a mano? (es. fornitore, importo, data)"}
 
 def esegui_azione(risultato):
     azione = risultato.get("azione")
@@ -328,12 +403,7 @@ def webhook():
                 mime = message["document"].get("mime_type", "image/jpeg")
                 file_url = get_file_url(file_id)
                 img_data = requests.get(file_url).content
-                # Se è un PDF, mandalo come documento base64 a Claude
-                if mime == "application/pdf":
-                    img_b64 = base64.b64encode(img_data).decode()
-                    mime = "application/pdf"
-                else:
-                    img_b64 = base64.b64encode(img_data).decode()
+                img_b64 = base64.b64encode(img_data).decode()
             caption = message.get("caption", "")
             risultato = chiedi_claude(testo=caption, immagine_b64=img_b64, mime_type=mime)
 
