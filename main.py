@@ -23,41 +23,64 @@ Hai memoria della conversazione — se l'utente ha già dato informazioni prima,
 
 DATA OGGI: {oggi}
 
-REGOLE IMPORTANTI:
-- Inserisci SUBITO con i dati disponibili. Se manca solo il numero fattura, usa stringa vuota. Se manca la data usa oggi.
-- Chiedi UNA SOLA cosa alla volta solo se manca qualcosa di essenziale (importo o tipo entrata/uscita).
-- NON chiedere numero fattura se l'utente ha detto che non ce l'ha.
-- NON chiedere metodo se non specificato: usa "Bonifico" per entrate, "Carta di credito" per uscite piccole.
-- IVA default 22%. Collaboratori forfettari (Albi, Marco, Milo, Karim) = 0%. Pasti = 10%.
-- Se l'utente dice "1500 + iva" → imponibile 1500, iva 22%.
-- Se l'utente dice "pagato X€" → scorpora IVA al 22%.
+REGOLE GENERALI:
+- IVA default 22%. Collaboratori forfettari (Albi, Marco, Milo, Karim) = 0%. Pasti = 10%. Carburante = 22%.
+- "1500 + iva" → imponibile 1500, iva_pct 0.22. "pagato X€" → scorpora IVA 22%.
+- Numero fattura mancante → usa stringa vuota "".
+- Metodo default: "Bonifico" per entrate, "Carta di credito" per uscite.
 
 CATEGORIE USCITE: Collaboratori, Consulenze Professionali, Attrezzatura, Software/Abbonamenti, Carburante, Trasferte, Ufficio/Utenze, Noleggi/Leasing, Assicurazioni, Pasti/Rappresentanza, Marketing, Altro
 CATEGORIE ENTRATE: Video Production, Motion Design, Art Direction, Post-Production, Consulenza, Altro
 METODI: Carta di credito, Bonifico, Addebito diretto, PayPal, Contanti
 
-Rispondi SEMPRE e SOLO con JSON valido, nessun testo extra.
+════════════════════════════════════════
+COMPORTAMENTO IN BASE AL TIPO DI INPUT
+════════════════════════════════════════
+
+SE L'UTENTE MANDA UNA FOTO O PDF:
+→ Estrai TUTTI i dati dal documento (data, importo, fornitore/cliente, IVA, metodo pagamento)
+→ Se trovi TUTTO → inserisci DIRETTAMENTE senza fare domande
+→ Se mancano solo dati NON essenziali (es. categoria) → deducili dal contesto e inserisci
+→ Chiedi SOLO se manca qualcosa di essenziale che non riesci a dedurre (es. se è uscita o entrata)
+
+SE L'UTENTE SCRIVE TESTO (non media):
+→ Devi raccogliere TUTTI i campi obbligatori prima di inserire.
+→ Se non hai tutti i dati, usa azione "schema" con i campi già noti e quelli mancanti.
+→ Solo quando hai TUTTI i dati obbligatori → inserisci.
+
+CAMPI OBBLIGATORI PER USCITA: data, fornitore, descrizione, categoria, importo, metodo pagamento
+CAMPI OBBLIGATORI PER ENTRATA: data, cliente, descrizione, importo+IVA, metodo, stato
+CAMPI OBBLIGATORI PER RIMBORSO: data, cliente, importo, descrizione
+
+════════════════════════════════════════
+AZIONI DISPONIBILI
+════════════════════════════════════════
+
+SCHEMA (quando mancano dati da testo — mostra cosa hai e cosa manca):
+{"azione":"schema","tipo":"uscita","raccolto":{"data":"11/07/2026","fornitore":"Amazon","importo":"89€"},"mancanti":["categoria","metodo pagamento"]}
 
 INSERISCI USCITA:
-{"azione":"inserisci_uscita","data":"DD/MM/YYYY","descrizione":"...","fornitore":"...","categoria":"...","metodo":"...","imponibile":123.45,"iva_pct":0.22,"note":"..."}
+{"azione":"inserisci_uscita","data":"DD/MM/YYYY","descrizione":"...","fornitore":"...","categoria":"...","metodo":"...","imponibile":123.45,"iva_pct":0.22,"note":""}
 
-INSERISCI ENTRATA (con IVA):
+INSERISCI ENTRATA:
 {"azione":"inserisci_entrata","data":"DD/MM/YYYY","descrizione":"...","cliente":"...","n_fattura":"","categoria":"Video Production","metodo":"Bonifico","imponibile":1500.00,"iva_pct":0.22,"stato":"Da incassare","note":""}
 
-INSERISCI RIMBORSO (entrata senza IVA, es. Berto, Giuse Barbieri, Repeople):
+INSERISCI RIMBORSO (entrata senza IVA — Berto, Giuse Barbieri, Repeople, ecc.):
 {"azione":"inserisci_rimborso","data":"DD/MM/YYYY","descrizione":"...","cliente":"...","importo":123.45,"note":""}
 
-MODIFICA:
-{"azione":"modifica","foglio":"Uscite","cerca_descrizione":"...","cerca_cliente_o_fornitore":"...","campo":"imponibile","nuovo_valore":"1500"}
+MODIFICA SINGOLA:
+{"azione":"modifica","foglio":"Uscite","cerca_descrizione":"...","cerca_cliente_o_fornitore":"...","cerca_data":"DD/MM/YYYY","campo":"imponibile","nuovo_valore":"1500"}
+
+MODIFICA MULTIPLA:
+{"azione":"modifica","foglio":"Entrate","cerca_cliente_o_fornitore":"Skeptical","cerca_data":"01/03/2026","modifiche":[{"campo":"imponibile","nuovo_valore":"1500"},{"campo":"stato","nuovo_valore":"Pagata"}]}
 
 ELIMINA:
 {"azione":"elimina","foglio":"Uscite","cerca_descrizione":"...","cerca_cliente_o_fornitore":"..."}
 
-DOMANDA (solo se manca info essenziale — UNA sola domanda):
-{"azione":"chiedi","testo":"Una sola domanda concisa"}
-
-RISPOSTA TESTUALE:
+RISPOSTA TESTUALE (per domande generali):
 {"azione":"risposta","testo":"..."}
+
+Rispondi SEMPRE e SOLO con JSON valido, nessun testo extra.
 """
 
 def get_sheets_service():
@@ -115,17 +138,36 @@ def get_sheet_data(sheet_name):
     ).execute()
     return result.get("values", [])
 
-def find_row(sheet_name, cerca_desc=None, cerca_nome=None):
+def find_row(sheet_name, cerca_desc=None, cerca_nome=None, cerca_data=None):
+    """Trova la riga più pertinente. Più criteri corrispondono = più alta la priorità."""
     data = get_sheet_data(sheet_name)
+    best_score = 0
+    best_row = (None, None)
+
     for i, row in enumerate(data):
         if i == 0:
             continue
+        if not any(row):
+            continue
+
         desc = row[1].lower() if len(row) > 1 else ""
         nome = row[2].lower() if len(row) > 2 else ""
-        match_desc = cerca_desc and cerca_desc.lower() in desc
-        match_nome = cerca_nome and cerca_nome.lower() in nome
-        if match_desc or match_nome:
-            return i + 1, row
+        data_cella = str(row[0]).lower() if len(row) > 0 else ""
+
+        score = 0
+        if cerca_desc and cerca_desc.lower() in desc:
+            score += 2
+        if cerca_nome and cerca_nome.lower() in nome:
+            score += 2
+        if cerca_data and cerca_data.lower() in data_cella:
+            score += 1
+
+        if score > best_score:
+            best_score = score
+            best_row = (i + 1, row)
+
+    if best_score > 0:
+        return best_row
     return None, None
 
 COL_MAP = {
@@ -255,16 +297,60 @@ def esegui_azione(risultato):
 
     elif azione == "modifica":
         d = risultato
-        foglio = d.get("foglio","Uscite")
-        row_num, _ = find_row(foglio, cerca_desc=d.get("cerca_descrizione"), cerca_nome=d.get("cerca_cliente_o_fornitore"))
+        foglio = d.get("foglio", "Uscite")
+        modifiche = d.get("modifiche", [])
+
+        # Supporta sia modifica singola che multipla
+        if not modifiche:
+            # Formato vecchio: campo + nuovo_valore singolo
+            campo = d.get("campo", "").lower()
+            nuovo = d.get("nuovo_valore")
+            if campo and nuovo is not None:
+                modifiche = [{"campo": campo, "nuovo_valore": nuovo}]
+
+        row_num, row_data = find_row(
+            foglio,
+            cerca_desc=d.get("cerca_descrizione"),
+            cerca_nome=d.get("cerca_cliente_o_fornitore"),
+            cerca_data=d.get("cerca_data")
+        )
         if row_num is None:
-            return "⚠️ Riga non trovata. Specifica meglio descrizione o cliente/fornitore."
-        campo = d.get("campo","").lower()
-        col = COL_MAP.get(foglio,{}).get(campo)
-        if not col:
-            return f"⚠️ Campo '{campo}' non riconosciuto."
-        update_cell(foglio, row_num, col, d.get("nuovo_valore"))
-        return f"✏️ *Modifica effettuata*\n📋 {foglio} — {campo} → {d.get('nuovo_valore')}"
+            return "⚠️ Riga non trovata. Prova a specificare meglio (es. cliente + mese, o descrizione più precisa)."
+
+        col_map = COL_MAP.get(foglio, {})
+        risultati_mod = []
+
+        for mod in modifiche:
+            campo = mod.get("campo", "").lower()
+            nuovo = mod.get("nuovo_valore")
+            col = col_map.get(campo)
+            if not col:
+                risultati_mod.append(f"⚠️ Campo '{campo}' non riconosciuto")
+                continue
+            update_cell(foglio, row_num, col, nuovo)
+            risultati_mod.append(f"  • {campo} → {nuovo}")
+
+        # Ricalcola IVA e totale se è stato modificato imponibile o iva_pct
+        campi_modificati = [m.get("campo","").lower() for m in modifiche]
+        if any(c in campi_modificati for c in ("imponibile", "iva_pct")) and foglio in ("Uscite", "Entrate"):
+            try:
+                data = get_sheet_data(foglio)
+                row = data[row_num - 1]
+                imp_col = col_map.get("imponibile")
+                iva_col = col_map.get("iva_pct")
+                imp = float(row[ord(imp_col) - ord("A")])
+                iva_pct = float(row[ord(iva_col) - ord("A")])
+                iva_eur = imp * iva_pct
+                tot = imp + iva_eur
+                update_cell(foglio, row_num, col_map["iva_eur"], round(iva_eur, 2))
+                update_cell(foglio, row_num, col_map["totale"], round(tot, 2))
+                risultati_mod.append(f"  • IVA€ ricalcolata → {iva_eur:.2f}")
+                risultati_mod.append(f"  • Totale ricalcolato → {tot:.2f}")
+            except Exception as e:
+                risultati_mod.append(f"  ⚠️ Errore ricalcolo IVA: {str(e)}")
+
+        desc = row_data[1] if row_data and len(row_data) > 1 else "?"
+        return f"✏️ *Modifica effettuata* — riga '{desc}' (foglio {foglio}):\n" + "\n".join(risultati_mod)
 
     elif azione == "elimina":
         d = risultato
@@ -275,6 +361,50 @@ def esegui_azione(risultato):
         delete_row(foglio, row_num)
         desc = row_data[1] if row_data and len(row_data) > 1 else "?"
         return f"🗑️ *Eliminata*: {desc}"
+
+    elif azione == "schema":
+        tipo = risultato.get("tipo", "uscita").upper()
+        raccolto = risultato.get("raccolto", {})
+        mancanti = risultato.get("mancanti", [])
+
+        # Etichette leggibili per i campi
+        etichette = {
+            "data": "📅 Data (GG/MM/AAAA)",
+            "fornitore": "🏷️ Fornitore",
+            "cliente": "👤 Cliente",
+            "descrizione": "📝 Descrizione",
+            "categoria": "📁 Categoria",
+            "importo": "💰 Importo (es: 100€ IVA inclusa, o 82€ + IVA)",
+            "metodo pagamento": "💳 Metodo (Carta / Bonifico / Contanti)",
+            "metodo": "💳 Metodo (Carta / Bonifico / Contanti)",
+            "stato": "✅ Stato (Da incassare / Pagata)",
+            "iva": "🧾 IVA %",
+            "n_fattura": "🔢 N° Fattura (opzionale)",
+        }
+
+        msg = f"📋 *{tipo}* — ho bisogno di altri dati:
+
+"
+
+        if raccolto:
+            msg += "✅ *Già ricevuto:*
+"
+            for k, v in raccolto.items():
+                msg += f"  • {etichette.get(k, k)}: {v}
+"
+            msg += "
+"
+
+        if mancanti:
+            msg += "❓ *Mancano ancora:*
+"
+            for campo in mancanti:
+                msg += f"  • {etichette.get(campo, campo)}
+"
+            msg += "
+Rispondimi con tutti i dati mancanti in un solo messaggio."
+
+        return msg
 
     elif azione in ("chiedi", "risposta"):
         return risultato.get("testo","")
