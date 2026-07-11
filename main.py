@@ -150,10 +150,16 @@ def chiedi_claude(testo=None, immagine_b64=None, mime_type="image/jpeg"):
     system = SYSTEM_PROMPT.replace("{oggi}", oggi)
 
     if immagine_b64:
-        content = [
-            {"type": "image", "source": {"type": "base64", "media_type": mime_type, "data": immagine_b64}},
-            {"type": "text", "text": testo or "Analizza questo scontrino/fattura e inseriscilo nel foglio contabilità."}
-        ]
+        if mime_type == "application/pdf":
+            content = [
+                {"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": immagine_b64}},
+                {"type": "text", "text": testo or "Analizza questa fattura/documento e inseriscila nel foglio contabilità di Kemp Studio."}
+            ]
+        else:
+            content = [
+                {"type": "image", "source": {"type": "base64", "media_type": mime_type, "data": immagine_b64}},
+                {"type": "text", "text": testo or "Analizza questo scontrino/fattura e inseriscilo nel foglio contabilità."}
+            ]
     else:
         content = testo
 
@@ -310,16 +316,24 @@ def webhook():
 
     try:
         if "photo" in message or "document" in message:
-            send_message(chat_id, "🔍 Analizzo lo scontrino...")
+            send_message(chat_id, "🔍 Analizzo il documento...")
             if "photo" in message:
                 file_id = message["photo"][-1]["file_id"]
                 mime = "image/jpeg"
+                file_url = get_file_url(file_id)
+                img_data = requests.get(file_url).content
+                img_b64 = base64.b64encode(img_data).decode()
             else:
                 file_id = message["document"]["file_id"]
                 mime = message["document"].get("mime_type", "image/jpeg")
-            file_url = get_file_url(file_id)
-            img_data = requests.get(file_url).content
-            img_b64 = base64.b64encode(img_data).decode()
+                file_url = get_file_url(file_id)
+                img_data = requests.get(file_url).content
+                # Se è un PDF, mandalo come documento base64 a Claude
+                if mime == "application/pdf":
+                    img_b64 = base64.b64encode(img_data).decode()
+                    mime = "application/pdf"
+                else:
+                    img_b64 = base64.b64encode(img_data).decode()
             caption = message.get("caption", "")
             risultato = chiedi_claude(testo=caption, immagine_b64=img_b64, mime_type=mime)
 
