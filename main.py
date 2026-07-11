@@ -7,17 +7,14 @@ from datetime import datetime
 
 app = Flask(__name__)
 
-# ── CONFIGURAZIONE ────────────────────────────────────────────────────────────
 TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN")
 ANTHROPIC_KEY    = os.environ.get("ANTHROPIC_KEY")
 SPREADSHEET_ID   = os.environ.get("SPREADSHEET_ID")
-GOOGLE_CREDS     = os.environ.get("GOOGLE_CREDS")  # JSON credenziali service account
-
+GOOGLE_CREDS     = os.environ.get("GOOGLE_CREDS")
 TELEGRAM_API     = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 
-# ── SYSTEM PROMPT ─────────────────────────────────────────────────────────────
 SYSTEM_PROMPT = """Sei l'assistente contabile di Kemp Studio SRL, studio italiano di video production.
-Analizzi messaggi di testo o immagini di scontrini/fatture e restituisci SOLO JSON valido.
+Analizzi messaggi di testo o immagini di scontrini/fatture e restituisci SOLO JSON valido, nessun testo aggiuntivo.
 
 DATA DEFAULT: {oggi}
 
@@ -26,29 +23,36 @@ REGOLE:
 - Collaboratori forfettari (Albi, Marco, Milo, Karim) = IVA 0%
 - Pasti/ristoranti = IVA 10%
 - Carburante = IVA 22%
-- Se non capisci qualcosa chiedi conferma con azione "chiedi"
 
 CATEGORIE USCITE: Collaboratori, Consulenze Professionali, Attrezzatura, Software/Abbonamenti, Carburante, Trasferte, Ufficio/Utenze, Noleggi/Leasing, Assicurazioni, Pasti/Rappresentanza, Marketing, Altro
 CATEGORIE ENTRATE: Video Production, Motion Design, Art Direction, Post-Production, Consulenza, Altro
 METODI: Carta di credito, Bonifico, Addebito diretto, PayPal, Contanti
 
-FORMATO USCITA:
+AZIONI DISPONIBILI:
+
+1. INSERISCI USCITA:
 {"azione":"inserisci_uscita","data":"DD/MM/YYYY","descrizione":"...","fornitore":"...","categoria":"...","metodo":"...","imponibile":123.45,"iva_pct":0.22,"note":"..."}
 
-FORMATO ENTRATA:
+2. INSERISCI ENTRATA (con IVA):
 {"azione":"inserisci_entrata","data":"DD/MM/YYYY","descrizione":"...","cliente":"...","n_fattura":"...","categoria":"Video Production","metodo":"Bonifico","imponibile":123.45,"iva_pct":0.22,"stato":"Da incassare","note":"..."}
 
-FORMATO RIMBORSO (entrata senza IVA da clienti come Berto, Giuse Barbieri):
+3. INSERISCI RIMBORSO (entrata senza IVA, es. Berto, Giuse Barbieri):
 {"azione":"inserisci_rimborso","data":"DD/MM/YYYY","descrizione":"...","cliente":"...","importo":123.45,"note":"..."}
 
-FORMATO DOMANDA/CHIARIMENTO:
-{"azione":"chiedi","testo":"La tua domanda qui"}
+4. MODIFICA RIGA - quando l'utente vuole correggere/aggiornare un dato esistente:
+{"azione":"modifica","foglio":"Uscite o Entrate o Rimborsi Spese","cerca_descrizione":"testo da cercare nella colonna descrizione","cerca_cliente_o_fornitore":"nome da cercare","campo":"nome colonna da modificare","nuovo_valore":"nuovo valore"}
+Campi modificabili: data, descrizione, fornitore, cliente, categoria, metodo, imponibile, iva_pct, stato, note, importo
 
-FORMATO RIEPILOGO:
-{"azione":"riepilogo","testo":"Risposta con dati dal foglio"}
+5. ELIMINA RIGA:
+{"azione":"elimina","foglio":"Uscite o Entrate o Rimborsi Spese","cerca_descrizione":"testo da cercare","cerca_cliente_o_fornitore":"nome da cercare"}
+
+6. DOMANDA O CHIARIMENTO:
+{"azione":"chiedi","testo":"La tua domanda"}
+
+7. RIEPILOGO:
+{"azione":"riepilogo","testo":"Risposta con calcoli"}
 """
 
-# ── GOOGLE SHEETS ─────────────────────────────────────────────────────────────
 def get_sheets_service():
     import google.oauth2.service_account as sa
     from googleapiclient.discovery import build
@@ -70,15 +74,77 @@ def append_row(sheet_name, values):
         body=body
     ).execute()
 
-def get_sheet_data(sheet_name, range_str="A:Z"):
+def get_sheet_data(sheet_name):
     service = get_sheets_service()
     result = service.spreadsheets().values().get(
         spreadsheetId=SPREADSHEET_ID,
-        range=f"{sheet_name}!{range_str}"
+        range=f"{sheet_name}!A:Z"
     ).execute()
     return result.get("values", [])
 
-# ── CLAUDE API ────────────────────────────────────────────────────────────────
+def find_row(sheet_name, cerca_desc=None, cerca_nome=None):
+    """Trova la riga che corrisponde alla ricerca. Restituisce (indice_riga, dati_riga) o None."""
+    data = get_sheet_data(sheet_name)
+    # Colonne: Uscite: A=data, B=desc, C=fornitore | Entrate: A=data, B=desc, C=cliente | Rimborsi: A=data, B=desc, C=cliente
+    for i, row in enumerate(data):
+        if i == 0:
+            continue  # salta intestazione
+        desc = row[1].lower() if len(row) > 1 else ""
+        nome = row[2].lower() if len(row) > 2 else ""
+        match_desc = cerca_desc and cerca_desc.lower() in desc
+        match_nome = cerca_nome and cerca_nome.lower() in nome
+        if match_desc or match_nome:
+            return i + 1, row  # +1 perché Sheets è 1-indexed
+    return None, None
+
+def update_cell(sheet_name, row_num, col_letter, value):
+    service = get_sheets_service()
+    service.spreadsheets().values().update(
+        spreadsheetId=SPREADSHEET_ID,
+        range=f"{sheet_name}!{col_letter}{row_num}",
+        valueInputOption="USER_ENTERED",
+        body={"values": [[value]]}
+    ).execute()
+
+def delete_row(sheet_name, row_num):
+    service = get_sheets_service()
+    # Ottieni sheet ID
+    meta = service.spreadsheets().get(spreadsheetId=SPREADSHEET_ID).execute()
+    sheet_id = None
+    for s in meta["sheets"]:
+        if s["properties"]["title"] == sheet_name:
+            sheet_id = s["properties"]["sheetId"]
+            break
+    if sheet_id is None:
+        return False
+    service.spreadsheets().batchUpdate(
+        spreadsheetId=SPREADSHEET_ID,
+        body={"requests": [{"deleteDimension": {"range": {
+            "sheetId": sheet_id,
+            "dimension": "ROWS",
+            "startIndex": row_num - 1,
+            "endIndex": row_num
+        }}}]}
+    ).execute()
+    return True
+
+# Mappa campo → lettera colonna
+COL_MAP = {
+    "Uscite": {
+        "data": "A", "descrizione": "B", "fornitore": "C", "categoria": "D",
+        "metodo": "E", "imponibile": "F", "iva_pct": "G", "iva_eur": "H",
+        "totale": "I", "note": "J"
+    },
+    "Entrate": {
+        "data": "A", "descrizione": "B", "cliente": "C", "n_fattura": "D",
+        "categoria": "E", "metodo": "F", "imponibile": "G", "iva_pct": "H",
+        "iva_eur": "I", "totale": "J", "stato": "K", "note": "L"
+    },
+    "Rimborsi Spese": {
+        "data": "A", "descrizione": "B", "cliente": "C", "importo": "D", "note": "E"
+    }
+}
+
 def chiedi_claude(testo=None, immagine_b64=None, mime_type="image/jpeg"):
     oggi = datetime.now().strftime("%d/%m/%Y")
     system = SYSTEM_PROMPT.replace("{oggi}", oggi)
@@ -100,7 +166,7 @@ def chiedi_claude(testo=None, immagine_b64=None, mime_type="image/jpeg"):
         },
         json={
             "model": "claude-sonnet-4-6",
-            "max_tokens": 500,
+            "max_tokens": 600,
             "system": system,
             "messages": [{"role": "user", "content": content}]
         }
@@ -109,7 +175,6 @@ def chiedi_claude(testo=None, immagine_b64=None, mime_type="image/jpeg"):
     raw = raw.replace("```json", "").replace("```", "").strip()
     return json.loads(raw)
 
-# ── ESEGUI AZIONE ─────────────────────────────────────────────────────────────
 def esegui_azione(risultato):
     azione = risultato.get("azione")
 
@@ -126,7 +191,7 @@ def esegui_azione(risultato):
             f"✅ *Uscita inserita*\n"
             f"📅 {d['data']}\n"
             f"🏷️ {d['fornitore']}\n"
-            f"💸 Imponibile: €{imp:.2f} | IVA: €{iva:.2f} | Totale: €{tot:.2f}\n"
+            f"💸 Imp: €{imp:.2f} | IVA: €{iva:.2f} | Tot: €{tot:.2f}\n"
             f"📁 {d['categoria']} — {d['metodo']}"
         )
 
@@ -144,7 +209,7 @@ def esegui_azione(risultato):
             f"✅ *Entrata inserita*\n"
             f"📅 {d['data']}\n"
             f"🏷️ {d['cliente']}\n"
-            f"💰 Imponibile: €{imp:.2f} | IVA: €{iva:.2f} | Totale: €{tot:.2f}\n"
+            f"💰 Imp: €{imp:.2f} | IVA: €{iva:.2f} | Tot: €{tot:.2f}\n"
             f"📁 {d['categoria']} — {d.get('stato','Da incassare')}"
         )
 
@@ -161,12 +226,68 @@ def esegui_azione(risultato):
             f"💵 €{imp:.2f}"
         )
 
+    elif azione == "modifica":
+        d = risultato
+        foglio = d.get("foglio", "Uscite")
+        row_num, row_data = find_row(
+            foglio,
+            cerca_desc=d.get("cerca_descrizione"),
+            cerca_nome=d.get("cerca_cliente_o_fornitore")
+        )
+        if row_num is None:
+            return "⚠️ Riga non trovata. Prova a essere più specifico sulla descrizione o il nome."
+
+        campo = d.get("campo", "").lower()
+        nuovo = d.get("nuovo_valore")
+        col_map = COL_MAP.get(foglio, {})
+        col = col_map.get(campo)
+
+        if not col:
+            return f"⚠️ Campo '{campo}' non riconosciuto."
+
+        update_cell(foglio, row_num, col, nuovo)
+
+        # Se modifico imponibile o iva_pct, ricalcola iva_eur e totale
+        if campo in ("imponibile", "iva_pct") and foglio in ("Uscite", "Entrate"):
+            try:
+                imp_col = col_map.get("imponibile")
+                iva_col = col_map.get("iva_pct")
+                data = get_sheet_data(foglio)
+                row = data[row_num - 1]
+                imp = float(row[ord(imp_col)-ord('A')])
+                iva_pct = float(row[ord(iva_col)-ord('A')])
+                iva_eur = imp * iva_pct
+                tot = imp + iva_eur
+                update_cell(foglio, row_num, col_map["iva_eur"], iva_eur)
+                update_cell(foglio, row_num, col_map["totale"], tot)
+            except:
+                pass
+
+        return (
+            f"✏️ *Modifica effettuata*\n"
+            f"📋 Foglio: {foglio}\n"
+            f"🔧 Campo: {campo} → {nuovo}"
+        )
+
+    elif azione == "elimina":
+        d = risultato
+        foglio = d.get("foglio", "Uscite")
+        row_num, row_data = find_row(
+            foglio,
+            cerca_desc=d.get("cerca_descrizione"),
+            cerca_nome=d.get("cerca_cliente_o_fornitore")
+        )
+        if row_num is None:
+            return "⚠️ Riga non trovata."
+        desc = row_data[1] if len(row_data) > 1 else "?"
+        delete_row(foglio, row_num)
+        return f"🗑️ *Riga eliminata*\n📋 {foglio}: {desc}"
+
     elif azione in ("chiedi", "riepilogo"):
         return risultato.get("testo", "")
 
     return "⚠️ Azione non riconosciuta"
 
-# ── TELEGRAM ──────────────────────────────────────────────────────────────────
 def send_message(chat_id, text):
     requests.post(f"{TELEGRAM_API}/sendMessage", json={
         "chat_id": chat_id,
@@ -179,7 +300,6 @@ def get_file_url(file_id):
     path = r.json()["result"]["file_path"]
     return f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/{path}"
 
-# ── WEBHOOK ───────────────────────────────────────────────────────────────────
 @app.route("/webhook", methods=["POST"])
 def webhook():
     data = request.json
@@ -189,7 +309,6 @@ def webhook():
         return jsonify({"ok": True})
 
     try:
-        # FOTO / DOCUMENTO
         if "photo" in message or "document" in message:
             send_message(chat_id, "🔍 Analizzo lo scontrino...")
             if "photo" in message:
@@ -198,14 +317,12 @@ def webhook():
             else:
                 file_id = message["document"]["file_id"]
                 mime = message["document"].get("mime_type", "image/jpeg")
-
             file_url = get_file_url(file_id)
             img_data = requests.get(file_url).content
             img_b64 = base64.b64encode(img_data).decode()
             caption = message.get("caption", "")
             risultato = chiedi_claude(testo=caption, immagine_b64=img_b64, mime_type=mime)
 
-        # TESTO
         elif "text" in message:
             testo = message["text"]
             if testo == "/start":
@@ -214,12 +331,13 @@ def webhook():
                     "Puoi:\n"
                     "📸 Mandarmi la *foto di uno scontrino*\n"
                     "✍️ Scrivere *'pagato 80€ benzina carta'*\n"
-                    "💰 O *'fattura Skeptical agosto 1500€'*\n\n"
-                    "Inserisco tutto nel foglio automaticamente!"
+                    "💰 O *'fattura Skeptical agosto 1500€'*\n"
+                    "✏️ O *'modifica fattura Berto giugno da 1000 a 1500'*\n"
+                    "🗑️ O *'elimina uscita Deliveroo del 10 maggio'*\n\n"
+                    "Inserisco e aggiorno tutto nel foglio automaticamente!"
                 )
                 return jsonify({"ok": True})
             risultato = chiedi_claude(testo=testo)
-
         else:
             send_message(chat_id, "Manda una foto o scrivi il movimento 👆")
             return jsonify({"ok": True})
